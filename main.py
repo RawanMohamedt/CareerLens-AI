@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from cv_extractor import extract_text
+from cv_extractor import extract_text_from_cv as extract_text
 from cv_cleaner import clean_cv_text_advanced
 from contact_extractor import extract_contact_info
 from skill_extractor import extract_skills_and_entities
