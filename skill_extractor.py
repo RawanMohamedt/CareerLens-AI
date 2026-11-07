@@ -2,20 +2,24 @@ import logging
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Optional, TypedDict
+from typing import Any, TypedDict
 
-import spacy
-from spacy.language import Language
-from spacy.matcher import PhraseMatcher
+try:
+    import spacy
+    from spacy.language import Language
+    from spacy.matcher import PhraseMatcher
+except ImportError:
+    spacy = None
+    Language = Any
+    PhraseMatcher = Any
 
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "en_core_web_sm"
 
-
-# =====================================================
-# 1. Skills vocabulary
-# =====================================================
+# =========================================================
+# 1. Multi-Domain Skills Vocabulary (Software, Data/AI, UI/UX, Product, ERP)
+# =========================================================
 
 DEFAULT_SKILLS: tuple[str, ...] = (
     # Programming languages
@@ -34,374 +38,270 @@ DEFAULT_SKILLS: tuple[str, ...] = (
     "REST API", "REST APIs", "GraphQL",
     "FastAPI", "Flask", "Django",
     "Bootstrap", "Tailwind CSS",
-    "Responsive Design", "Web Development",
+    "Responsive Design", "Responsive Interfaces", "Web Development",
 
-    # Databases
-    "SQL", "SQL Server", "MySQL", "PostgreSQL",
-    "SQLite", "MongoDB", "Oracle Database",
-    "Redis", "Database Design", "Database Management",
+    # UI/UX & Product Design
+    "UI/UX Design", "UX/UI Design", "UX Design", "UI Design",
+    "User Research", "UX Research", "User Interviews", "Stakeholder Interviews",
+    "User Flows", "User Journeys", "Journey Mapping", "Personas",
+    "Information Architecture", "Wireframing", "Wireframes",
+    "Prototyping", "Interactive Prototypes", "High-Fidelity UI",
+    "High-Fidelity Prototypes", "Low-Fidelity Prototypes",
+    "Usability", "Usability Testing", "Usability Reviews",
+    "Visual Hierarchy", "Layout & Spacing", "Typography", "Color Theory",
+    "Design Systems", "Design System", "Component Libraries", "UI Components",
+    "Figma", "Auto Layout", "Figma Variables", "Figma Components", "Dev Mode",
+    "Developer Handoff", "Sketch", "Adobe XD", "Photoshop", "Illustrator",
+    "InVision", "Framer", "Zeplin", "Miro", "FigJam",
+    "Accessibility", "WCAG", "Arabic RTL", "Bilingual Interfaces",
+    "Micro-interactions", "Motion Design", "Brand Identity",
 
-    # Data analysis
-    "Pandas", "NumPy", "SciPy",
-    "Matplotlib", "Seaborn",
-    "Excel", "Microsoft Excel",
-    "Power BI", "Tableau",
-    "Data Analysis", "Data Visualization",
-    "Statistics", "Exploratory Data Analysis",
-    "ETL", "Data Cleaning",
+    # Mobile Development
+    "Flutter", "React Native", "Android Development",
+    "iOS Development", "Mobile App Development",
 
-    # AI and machine learning
-    "Artificial Intelligence", "AI",
-    "Machine Learning", "Deep Learning",
-    "Natural Language Processing", "NLP",
-    "Computer Vision",
-    "Generative AI", "Large Language Models",
-    "LLM", "LLMs", "RAG",
-    "Retrieval-Augmented Generation",
-    "Prompt Engineering", "LangChain",
-    "Hugging Face", "OpenAI API",
-    "Google Gemini", "Gemini API",
-    "Scikit-learn", "TensorFlow", "PyTorch",
-    "Keras", "XGBoost",
-    "Feature Engineering", "Model Evaluation",
-    "Model Training", "Neural Networks",
-    "spaCy", "NLTK", "Transformers",
-    "Streamlit", "Gradio",
+    # Databases & Storage
+    "SQL", "MySQL", "PostgreSQL", "SQLite",
+    "Microsoft SQL Server", "SQL Server", "T-SQL",
+    "MongoDB", "Redis", "Cassandra", "Oracle",
+    "Firebase", "Supabase", "NoSQL",
 
-    # UI/UX and design
-    "UI/UX", "UI Design", "UX Design",
-    "UI/UX Design", "User Interface Design",
-    "User Experience Design", "Figma",
-    "Adobe XD", "Adobe Illustrator",
-    "Adobe Photoshop", "Illustrator", "Photoshop",
-    "Wireframing", "Prototyping",
-    "User Research", "Usability Testing",
-    "Interaction Design", "Information Architecture",
-    "Design Systems", "User Flows", "Visual Design",
-
-    # Software engineering
+    # DevOps, Cloud, ERP & Tools
+    "Git", "GitHub", "GitLab", "Bitbucket",
+    "Docker", "Kubernetes", "CI/CD",
+    "AWS", "Amazon Web Services", "Azure",
+    "Google Cloud Platform", "GCP",
+    "Linux", "Unix", "Jira", "Agile", "Scrum",
+    "Odoo", "ERP", "SaaS", "eCommerce",
     "Object-Oriented Programming", "OOP",
     "Data Structures", "Algorithms",
-    "Software Engineering", "Software Development",
-    "MVC", "Dependency Injection",
-    "Unit Testing", "Debugging",
-    "Clean Code", "Design Patterns",
+    "Software Architecture", "Design Patterns",
 
-    # DevOps, cloud, and tools
-    "Git", "GitHub", "GitLab",
-    "Docker", "Kubernetes",
-    "AWS", "Amazon Web Services",
-    "Microsoft Azure", "Azure",
-    "Google Cloud", "GCP", "CI/CD", "Linux",
-    "Visual Studio", "Visual Studio Code",
-    "VS Code", "Jupyter Notebook",
-    "Postman", "Swagger",
-
-    # General professional skills
-    "Requirements Analysis",
-    "Problem Solving", "Communication",
-    "Teamwork", "Time Management",
-    "Critical Thinking", "Project Management",
+    # Data Science, AI & ML
+    "Machine Learning", "Deep Learning", "Data Analysis",
+    "Data Science", "Pandas", "NumPy", "Scikit-Learn",
+    "TensorFlow", "PyTorch", "Keras", "OpenCV",
+    "NLP", "Natural Language Processing",
+    "Computer Vision", "Matplotlib", "Seaborn",
+    "Power BI", "Tableau", "Excel",
 )
 
-# Short or common-word skills that must match with exact casing
-# to avoid false positives (e.g. "go" in a sentence, "r" in a list).
-CASE_SENSITIVE_SKILLS: frozenset[str] = frozenset({"C", "R", "Go", "AI"})
+SKILL_ALIASES: dict[str, str] = {
+    "golang": "Go",
+    "react.js": "React",
+    "reactjs": "React",
+    "vue.js": "Vue.js",
+    "vuejs": "Vue.js",
+    "node.js": "Node.js",
+    "nodejs": "Node.js",
+    "express.js": "Express.js",
+    "expressjs": "Express.js",
+    "next.js": "Next.js",
+    "nextjs": "Next.js",
+    "asp.net core": "ASP.NET Core",
+    "asp.net core mvc": "ASP.NET Core MVC",
+    "entity framework core": "Entity Framework Core",
+    "ef core": "Entity Framework Core",
+    "rest apis": "REST API",
+    "restful api": "REST API",
+    "restful apis": "REST API",
+    "amazon web services": "AWS",
+    "google cloud platform": "GCP",
+    "html5": "HTML",
+    "css3": "CSS",
+    "microsoft sql server": "Microsoft SQL Server",
+    "t-sql": "SQL Server",
+    "object-oriented programming": "OOP",
+    "ux/ui design": "UI/UX Design",
+    "ui & ux": "UI/UX Design",
+    "ui/ux": "UI/UX Design",
+    "ux research": "User Research",
+    "wireframes": "Wireframing",
+    "interactive prototypes": "Prototyping",
+    "high-fidelity prototypes": "Prototyping",
+    "design system": "Design Systems",
+    "responsive interfaces": "Responsive Design",
+    "usability reviews": "Usability Testing",
+}
+
+PRESERVE_CASE_SKILLS: set[str] = {
+    "C", "C++", "C#", "R", "Go", "Git", "AWS", "GCP", "SQL", "OOP",
+    "LINQ", "NLP", "CI/CD", "UI/UX Design", "UX Design", "UI Design",
+    "WCAG", "ERP", "SaaS", "Odoo", "Adobe XD"
+}
 
 
-# =====================================================
-# 2. Heuristic hint lists (matched as whole words)
-# =====================================================
-
-JOB_TITLE_HINTS = (
-    "developer", "engineer", "designer", "manager", "intern",
-    "trainee", "student", "analyst", "specialist", "consultant",
-    "administrator", "architect",
-)
-
-LOCATION_HINTS = (
-    "minufiyah", "menoufia", "egypt", "cairo", "alexandria", "governorate",
-)
-
-ORGANIZATION_HINTS = (
-    "university", "college", "faculty", "institute", "school",
-    "scholarship", "platform", "company", "corporation", "foundation",
-    "technologies", "ltd", "inc",
-)
-
-EDUCATION_HINTS = (
-    "bachelor's degree", "bachelor degree", "master's degree",
-    "master degree", "phd", "b.sc", "m.sc", "computer science", "degree in",
-)
-
-CONTACT_HINTS = (
-    "email:", "phone:", "linkedin", "github", "www.", "http://", "https://",
-)
+class SkillOccurrence(TypedDict):
+    canonical: str
+    matched_text: str
+    start_char: int
+    end_char: int
+    confidence: float
 
 
-def _compile_hints(hints: tuple[str, ...]) -> re.Pattern:
-    """Build one regex that matches any hint as a whole phrase."""
-    alternatives = "|".join(re.escape(hint) for hint in hints)
-    return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
+@dataclass
+class SkillExtractionResult:
+    raw_skills: list[str] = field(default_factory=list)
+    canonical_skills: list[str] = field(default_factory=list)
+    occurrences: list[SkillOccurrence] = field(default_factory=list)
 
 
-JOB_TITLE_RE = _compile_hints(JOB_TITLE_HINTS)
-LOCATION_RE = _compile_hints(LOCATION_HINTS)
-ORGANIZATION_RE = _compile_hints(ORGANIZATION_HINTS)
-EDUCATION_RE = _compile_hints(EDUCATION_HINTS)
-CONTACT_RE = _compile_hints(CONTACT_HINTS)
-
-
-# =====================================================
-# 3. Model loading
-# =====================================================
+# =========================================================
+# 2. Spacy Pipeline Loader (with Pure-Regex Fallback if spaCy unavailable)
+# =========================================================
 
 @lru_cache(maxsize=1)
-def get_nlp() -> Language:
-    """Load the spaCy model once, with a clear error if it is missing."""
+def get_nlp_model() -> Language | None:
+    if spacy is None:
+        return None
     try:
         return spacy.load(MODEL_NAME)
-    except OSError as exc:
-        raise RuntimeError(
-            f"spaCy model '{MODEL_NAME}' is not installed. "
-            f"Run: python -m spacy download {MODEL_NAME}"
-        ) from exc
+    except OSError:
+        logger.info("Model '%s' not found. Falling back to spacy.blank('en').", MODEL_NAME)
+        return spacy.blank("en")
 
 
-# =====================================================
-# 4. Skill matching
-# =====================================================
+# =========================================================
+# 3. Matcher Construction
+# =========================================================
 
-@lru_cache(maxsize=8)
-def get_skill_matchers(
-    skills: tuple[str, ...],
-) -> tuple[PhraseMatcher, PhraseMatcher]:
-    """
-    Return two matchers:
-    - loose: case-insensitive, for most skills
-    - strict: exact-casing, for ambiguous short skills
-    """
-    nlp = get_nlp()
+def canonicalize_skill_name(skill_name: str) -> str:
+    cleaned = skill_name.strip()
+    lower_name = cleaned.lower()
 
-    loose = PhraseMatcher(nlp.vocab, attr="LOWER")
-    strict = PhraseMatcher(nlp.vocab, attr="ORTH")
+    if lower_name in SKILL_ALIASES:
+        return SKILL_ALIASES[lower_name]
 
-    loose_patterns = []
-    strict_patterns = []
+    if cleaned in PRESERVE_CASE_SKILLS:
+        return cleaned
 
-    for skill in skills:
-        pattern = nlp.make_doc(skill)
-        if skill in CASE_SENSITIVE_SKILLS:
-            strict_patterns.append(pattern)
-        else:
-            loose_patterns.append(pattern)
+    if cleaned.isupper() and len(cleaned) <= 5:
+        return cleaned
 
-    if loose_patterns:
-        loose.add("SKILL", loose_patterns)
-    if strict_patterns:
-        strict.add("SKILL_STRICT", strict_patterns)
-
-    return loose, strict
+    return cleaned.title()
 
 
-def find_skills(
-    doc,
-    skills: tuple[str, ...],
-    display_names: dict[str, str],
-) -> list[str]:
-    """Return the skills found in the doc, in order of appearance."""
-    loose, strict = get_skill_matchers(skills)
+@lru_cache(maxsize=1)
+def get_skill_matcher() -> tuple[PhraseMatcher | None, dict[str, str]]:
+    canonical_map: dict[str, str] = {}
+    for skill in DEFAULT_SKILLS:
+        canonical_map[skill.lower()] = canonicalize_skill_name(skill)
+    for alias, canonical in SKILL_ALIASES.items():
+        canonical_map[alias.lower()] = canonical
 
-    # Collect (start, end, canonical_name) for every match.
-    candidates: list[tuple[int, int, str]] = []
+    nlp = get_nlp_model()
+    if nlp is None:
+        return None, canonical_map
 
-    for _, start, end in loose(doc):
-        key = doc[start:end].text.casefold()
-        candidates.append((start, end, display_names[key]))
-
-    for _, start, end in strict(doc):
-        text = doc[start:end].text
-        candidates.append((start, end, text))
-
-    # Prefer longer matches so "ASP.NET Core MVC" beats "ASP.NET".
-    candidates.sort(key=lambda c: (-(c[1] - c[0]), c[0]))
-
-    selected_spans: list[tuple[int, int]] = []
-    found: list[tuple[int, str]] = []
-    seen_names: set[str] = set()
-
-    for start, end, name in candidates:
-        overlaps = any(
-            start < s_end and end > s_start
-            for s_start, s_end in selected_spans
-        )
-        if overlaps:
-            continue
-
-        selected_spans.append((start, end))
-
-        if name.casefold() not in seen_names:
-            seen_names.add(name.casefold())
-            found.append((start, name))
-
-    found.sort(key=lambda item: item[0])
-    return [name for _, name in found]
+    matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
+    patterns = [nlp.make_doc(k) for k in canonical_map]
+    matcher.add("SKILLS", patterns)
+    return matcher, canonical_map
 
 
-# =====================================================
-# 5. Entity cleaning
-# =====================================================
+# =========================================================
+# 4. Special skills regex matcher (C, C++, C#, R, Go, UI/UX, etc.)
+# =========================================================
 
-_FRAGMENT_SPLIT_RE = re.compile(r"[\r\n|•;]+")
-_WHITESPACE_RE = re.compile(r"\s+")
-
-
-def split_entity_fragments(entity_text: str) -> list[str]:
-    """Split an entity span that accidentally spans several lines."""
-    cleaned = []
-    for fragment in _FRAGMENT_SPLIT_RE.split(entity_text):
-        fragment = _WHITESPACE_RE.sub(" ", fragment).strip()
-        fragment = fragment.strip(" \t-–—:|,;")
-        if fragment:
-            cleaned.append(fragment)
-    return cleaned
+SPECIAL_SKILLS_PATTERNS = [
+    (r"(?<![A-Za-z0-9#+])C\+\+(?![A-Za-z0-9#+])", "C++"),
+    (r"(?<![A-Za-z0-9#+])C#(?![A-Za-z0-9#+])", "C#"),
+    (r"(?<![A-Za-z0-9#+])\.NET(?![A-Za-z0-9#+])", ".NET"),
+    (r"(?<![A-Za-z0-9#+])\.NET Core(?![A-Za-z0-9#+])", ".NET Core"),
+    (r"(?<![A-Za-z0-9#+])ASP\.NET(?![A-Za-z0-9#+])", "ASP.NET"),
+    (r"(?<![A-Za-z0-9#+])ASP\.NET Core(?![A-Za-z0-9#+])", "ASP.NET Core"),
+    (r"(?<![A-Za-z0-9#+])C(?![A-Za-z0-9#+])", "C"),
+    (r"(?<![A-Za-z0-9#+])R(?![A-Za-z0-9#+])", "R"),
+    (r"(?<![A-Za-z0-9#+])Go(?![A-Za-z0-9#+])", "Go"),
+]
 
 
-def _is_contact_or_header(text: str) -> bool:
-    return CONTACT_RE.search(text) is not None
+def extract_special_skills(text: str) -> list[SkillOccurrence]:
+    occurrences: list[SkillOccurrence] = []
+
+    for pattern, canonical in SPECIAL_SKILLS_PATTERNS:
+        flags = re.IGNORECASE if canonical not in {"C", "R", "Go"} else 0
+        for match in re.finditer(pattern, text, flags=flags):
+            matched_text = match.group(0)
+            occurrences.append({
+                "canonical": canonical,
+                "matched_text": matched_text,
+                "start_char": match.start(),
+                "end_char": match.end(),
+                "confidence": 0.95
+            })
+
+    return occurrences
 
 
-def is_probably_not_person(text: str, skill_keys: set[str]) -> bool:
-    words = text.split()
+# =========================================================
+# 5. Extract Skills Function
+# =========================================================
 
-    if not 2 <= len(words) <= 6:
-        return True
-    if len(text) > 70:
-        return True
-    if _is_contact_or_header(text):
-        return True
-    if text.casefold() in skill_keys:
-        return True
-    return any(
-        pattern.search(text) is not None
-        for pattern in (JOB_TITLE_RE, LOCATION_RE, ORGANIZATION_RE, EDUCATION_RE)
-    )
+def extract_skills(text: str) -> SkillExtractionResult:
+    if not text or not text.strip():
+        return SkillExtractionResult()
 
+    nlp = get_nlp_model()
+    matcher, canonical_map = get_skill_matcher()
 
-def is_probably_not_organization(text: str, skill_keys: set[str]) -> bool:
-    if len(text) > 120:
-        return True
-    if _is_contact_or_header(text):
-        return True
-    if text.casefold() in skill_keys:
-        return True
-    return any(
-        pattern.search(text) is not None
-        for pattern in (EDUCATION_RE, JOB_TITLE_RE)
-    )
+    occurrences: list[SkillOccurrence] = []
+    seen_spans = set()
 
-
-# =====================================================
-# 6. Entity extraction
-# =====================================================
-
-class Entities(TypedDict):
-    persons: list[str]
-    organizations: list[str]
-    candidate_name: Optional[str]
-
-
-class ExtractionResult(TypedDict):
-    skills: list[str]
-    entities: Entities
-
-
-def extract_entities(doc, skill_keys: set[str]) -> Entities:
-    persons: list[str] = []
-    organizations: list[str] = []
-
-    for ent in doc.ents:
-        for fragment in split_entity_fragments(ent.text):
-            if fragment.casefold() in skill_keys:
+    if nlp is not None and matcher is not None:
+        doc = nlp(text)
+        matches = matcher(doc)
+        for match_id, start, end in matches:
+            span = doc[start:end]
+            span_key = (span.start_char, span.end_char)
+            if span_key in seen_spans:
                 continue
-
-            # spaCy sometimes labels companies or platforms as PERSON.
-            if ORGANIZATION_RE.search(fragment):
-                if not is_probably_not_organization(fragment, skill_keys):
-                    organizations.append(fragment)
+            seen_spans.add(span_key)
+            matched_text = span.text.strip()
+            matched_lower = matched_text.lower()
+            if matched_lower in {"c", "r", "go"}:
                 continue
+            canonical = canonical_map.get(matched_lower, canonicalize_skill_name(matched_text))
+            occurrences.append({
+                "canonical": canonical,
+                "matched_text": matched_text,
+                "start_char": span.start_char,
+                "end_char": span.end_char,
+                "confidence": 0.90
+            })
+    else:
+        # Pure-regex fallback when spaCy is not installed
+        for phrase_lower, canonical in sorted(canonical_map.items(), key=lambda x: -len(x[0])):
+            if phrase_lower in {"c", "r", "go", "c++", "c#", ".net", ".net core", "asp.net", "asp.net core"}:
+                continue
+            pattern = r"(?<![A-Za-z0-9#+])" + re.escape(phrase_lower) + r"(?![A-Za-z0-9#+])"
+            for m in re.finditer(pattern, text, flags=re.IGNORECASE):
+                span_key = (m.start(), m.end())
+                if any(not (m.end() <= s or m.start() >= e) for s, e in seen_spans):
+                    continue
+                seen_spans.add(span_key)
+                occurrences.append({
+                    "canonical": canonical,
+                    "matched_text": m.group(0),
+                    "start_char": m.start(),
+                    "end_char": m.end(),
+                    "confidence": 0.90
+                })
 
-            if ent.label_ == "PERSON":
-                if not is_probably_not_person(fragment, skill_keys):
-                    persons.append(fragment)
-            elif ent.label_ == "ORG":
-                if not is_probably_not_organization(fragment, skill_keys):
-                    organizations.append(fragment)
+    special_occurrences = extract_special_skills(text)
+    for spec in special_occurrences:
+        span_key = (spec["start_char"], spec["end_char"])
+        if not any(not (spec["end_char"] <= s or spec["start_char"] >= e) for s, e in seen_spans):
+            seen_spans.add(span_key)
+            occurrences.append(spec)
 
-    persons = list(dict.fromkeys(persons))
-    organizations = list(dict.fromkeys(organizations))
+    occurrences.sort(key=lambda x: x["start_char"])
 
-    return {
-        "persons": persons,
-        "organizations": organizations,
-        # Heuristic only. The AI extraction should be the primary source.
-        "candidate_name": persons[0] if persons else None,
-    }
+    raw_skills = [occ["matched_text"] for occ in occurrences]
+    canonical_skills = list(dict.fromkeys(occ["canonical"] for occ in occurrences))
 
-
-# =====================================================
-# 7. Public API
-# =====================================================
-
-def _build_skill_vocabulary(custom_skills: Optional[list[str]]) -> tuple[
-    tuple[str, ...], dict[str, str]
-]:
-    """Merge default and custom skills, deduplicated case-insensitively."""
-    display_names: dict[str, str] = {}
-
-    for skill in [*DEFAULT_SKILLS, *(custom_skills or [])]:
-        if isinstance(skill, str) and skill.strip():
-            cleaned = skill.strip()
-            display_names.setdefault(cleaned.casefold(), cleaned)
-
-    skills = tuple(display_names.values())
-    return skills, display_names
-
-
-def extract_skills_and_entities(
-    text: str,
-    custom_skills_list: Optional[list[str]] = None,
-) -> ExtractionResult:
-    empty: ExtractionResult = {
-        "skills": [],
-        "entities": {
-            "persons": [],
-            "organizations": [],
-            "candidate_name": None,
-        },
-    }
-
-    if not isinstance(text, str) or not text.strip():
-        return empty
-
-    try:
-        nlp = get_nlp()
-    except RuntimeError:
-        logger.exception("Failed to load spaCy model")
-        raise
-
-    doc = nlp(text)
-
-    skills, display_names = _build_skill_vocabulary(custom_skills_list)
-    found_skills = find_skills(doc, skills, display_names)
-
-    skill_keys = {skill.casefold() for skill in found_skills}
-    entities = extract_entities(doc, skill_keys)
-
-    logger.debug(
-        "Extracted %d skills and %d persons",
-        len(found_skills),
-        len(entities["persons"]),
+    return SkillExtractionResult(
+        raw_skills=raw_skills,
+        canonical_skills=canonical_skills,
+        occurrences=occurrences
     )
-
-    return {"skills": found_skills, "entities": entities}

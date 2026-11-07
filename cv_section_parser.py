@@ -1,7 +1,6 @@
 import re
 import unicodedata
 
-
 SECTION_ALIASES = {
     "summary": [
         "summary",
@@ -107,22 +106,20 @@ def normalize_heading(line: str) -> str:
 
     # Remove common bullets and numbering at the start.
     line = re.sub(
-        r"^\s*(?:[-*•▪◦‣]+|\d{1,2}[.)])\s*",
+        r"^\s*(?:[-*•·+]|\d{1,2}[.])\s*",
         "",
         line,
     )
 
     # Remove common separators at the end.
-    line = re.sub(r"[:：|]+\s*$", "", line)
+    line = re.sub(r"[: |]+\s*$", "", line)
 
     # Normalize whitespace.
     line = re.sub(r"\s+", " ", line)
 
-    return line.strip(" \t-–—|:：")
+    return line.strip(" \t---|: :")
 
 
-# Build a normalized lookup once, rather than checking every alias
-# for every line.
 NORMALIZED_ALIASES = {
     normalize_heading(alias): section
     for section, aliases in SECTION_ALIASES.items()
@@ -138,6 +135,20 @@ def detect_section_heading(line: str):
         return None
 
     return NORMALIZED_ALIASES.get(heading)
+
+
+def detect_inline_section_heading(line: str) -> tuple[str | None, str]:
+    """
+    Detect inline headings such as 'Skills: Python, SQL' or 'Languages: Arabic, English'.
+    Returns (section_key, remainder_text).
+    """
+    if ":" not in line:
+        return None, ""
+    prefix, remainder = line.split(":", 1)
+    section = detect_section_heading(prefix)
+    if section and remainder.strip():
+        return section, remainder.strip()
+    return None, ""
 
 
 def parse_cv_sections(text: str) -> dict:
@@ -168,9 +179,14 @@ def parse_cv_sections(text: str) -> dict:
             continue
 
         detected_section = detect_section_heading(cleaned_line)
-
         if detected_section:
             current_section = detected_section
+            continue
+
+        inline_section, remainder = detect_inline_section_heading(cleaned_line)
+        if inline_section:
+            current_section = inline_section
+            sections[current_section].append(remainder)
             continue
 
         sections[current_section].append(cleaned_line)

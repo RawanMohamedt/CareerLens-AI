@@ -1,11 +1,15 @@
 import re
-from datetime import datetime
-from sentence_transformers import SentenceTransformer, util
+import numpy as np
 
+try:
+    from sentence_transformers import SentenceTransformer, util
+except ImportError:
+    SentenceTransformer = None
+    util = None
 
-# =====================================================
+# ===================================================
 # 1. Configuration
-# =====================================================
+# ===================================================
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -18,742 +22,575 @@ WEIGHTS = {
     "education": 5,
 }
 
-# Similarity thresholds (0 to 1). These are starting guesses.
-# Tune them later using a labeled dataset of CV/job pairs.
 SKILL_MATCH_THRESHOLD = 0.72
 SKILL_REVIEW_THRESHOLD = 0.55
 RESPONSIBILITY_THRESHOLD = 0.48
 EDUCATION_FIELD_THRESHOLD = 0.40
 
-# Degree levels used to compare education without keyword lists per field.
 DEGREE_LEVELS = {
-    "phd": 3,
-    "doctorate": 3,
-    "doctoral": 3,
-    "master": 2,
-    "msc": 2,
-    "mba": 2,
     "bachelor": 1,
+    "bs": 1,
     "bsc": 1,
+    "ba": 1,
+    "licentiate": 1,
+    "faculty of": 1,
     "undergraduate": 1,
+    "major": 1,
+    "master": 2,
+    "ms": 2,
+    "msc": 2,
+    "ma": 2,
+    "phd": 3,
+    "doctor": 3,
+    "doctorate": 3,
 }
 
 _model = None
 
 
-# =====================================================
-# 2. Load Model
-# =====================================================
-
 def load_model():
     global _model
-
-    if _model is None:
-        print("Loading embedding model...")
+    if _model is None and SentenceTransformer is not None:
         _model = SentenceTransformer(MODEL_NAME)
-        print("Embedding model loaded successfully.")
-
     return _model
 
 
-# =====================================================
-# 3. General Helpers
-# =====================================================
+def get_model():
+    return load_model()
+
+
+# ===================================================
+# 2. Text Normalization & Phrase Matching Helpers
+# ===================================================
 
 def to_list(value):
     if value is None:
         return []
-
     if isinstance(value, list):
-        return value
-
+        expanded = []
+        for item in value:
+            if isinstance(item, str) and "\n" in item:
+                expanded.extend(line.strip() for line in item.splitlines() if line.strip())
+            else:
+                expanded.append(item)
+        return expanded
     if isinstance(value, str):
-        return [value] if value.strip() else []
-
-    return []
+        return [line.strip() for line in value.splitlines() if line.strip()]
+    return [value]
 
 
 def clean_text(value):
     if value is None:
         return ""
-
     if isinstance(value, str):
         return value.strip()
-
+    if isinstance(value, (int, float)):
+        return str(value)
     if isinstance(value, list):
-        return " ".join(
-            clean_text(item)
-            for item in value
-            if clean_text(item)
-        )
-
+        return " ".join(clean_text(item) for item in value if clean_text(item))
     if isinstance(value, dict):
         ignored = {"dates", "grade", "institution", "company"}
-
         return " ".join(
             clean_text(v)
             for k, v in value.items()
             if k.lower() not in ignored and v is not None
         )
-
     return str(value).strip()
+
+
+SKILL_SYNONYM_REPLACEMENTS = [
+    (r"\bux\s*/\s*ui\b", "ui ux"),
+    (r"\bui\s*/\s*ux\b", "ui ux"),
+    (r"\bux\s+research\b", "user research"),
+    (r"\busability\s+testing\b", "usability"),
+    (r"\busability\s+reviews\b", "usability"),
+    (r"\bresponsive\s+interfaces\b", "responsive design"),
+]
 
 
 def normalize_text(text):
     text = str(text).lower()
     text = text.replace("&", " and ")
+    for pat, repl in SKILL_SYNONYM_REPLACEMENTS:
+        text = re.sub(pat, repl, text)
     text = re.sub(r"[^a-z0-9+#. ]", " ", text)
     return " ".join(text.split())
 
 
 def contains_phrase(text, phrase):
-    text = normalize_text(text)
-    phrase = normalize_text(phrase)
-
-    if not text or not phrase:
+    """
+    Match whole phrases while preventing 'C' from falsely matching 'C++' or 'C#',
+    and supporting '.js' variations (e.g. 'node.js' vs 'nodejs').
+    """
+    text_norm = normalize_text(text)
+    phrase_norm = normalize_text(phrase)
+    if not text_norm or not phrase_norm:
         return False
 
-    pattern = r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])"
-    return bool(re.search(pattern, text))
+    pattern = r"(?<![a-z0-9+#])" + re.escape(phrase_norm) + r"(?![a-z0-9+#])"
+    if re.search(pattern, text_norm):
+        return True
+
+    # Support Node.js <-> nodejs / React.js <-> reactjs
+    if ".js" in phrase_norm or ".js" in text_norm:
+        t_no_dot = text_norm.replace(".js", "js")
+        p_no_dot = phrase_norm.replace(".js", "js")
+        pattern_js = r"(?<![a-z0-9+#])" + re.escape(p_no_dot) + r"(?![a-z0-9+#])"
+        return bool(re.search(pattern_js, t_no_dot))
+
+    return False
 
 
-def flatten_records(items):
-    results = []
-
-    for item in to_list(items):
-        text = clean_text(item)
-        if text:
-            results.append(text)
-
-    return results
+def _token_overlap_similarity(text1: str, text2: str) -> float:
+    """Fallback similarity when SentenceTransformer model is offline/unavailable."""
+    t1 = set(normalize_text(text1).split())
+    t2 = set(normalize_text(text2).split())
+    if not t1 or not t2:
+        return 0.0
+    return len(t1 & t2) / max(1, min(len(t1), len(t2)) * 0.5 + max(len(t1), len(t2)) * 0.5)
 
 
-def best_semantic_match(query, candidates):
-    """Return the highest cosine similarity (0 to 1) and the best candidate text."""
-    query = clean_text(query)
-    candidates = [clean_text(c) for c in to_list(candidates) if clean_text(c)]
+def compute_similarity_matrix(candidate_items, target_items):
+    c_texts = [clean_text(item) for item in candidate_items]
+    t_texts = [clean_text(item) for item in target_items]
 
-    if not query or not candidates:
-        return 0.0, ""
+    c_valid = [t for t in c_texts if t]
+    t_valid = [t for t in t_texts if t]
+
+    if not c_valid or not t_valid:
+        return None, [], []
 
     model = load_model()
+    if model is not None:
+        c_embeddings = model.encode(c_valid, convert_to_numpy=True, normalize_embeddings=True)
+        t_embeddings = model.encode(t_valid, convert_to_numpy=True, normalize_embeddings=True)
+        sim_matrix = np.matmul(c_embeddings, t_embeddings.T)
+        return sim_matrix, c_valid, t_valid
 
-    embeddings = model.encode(
-        [query] + candidates,
-        convert_to_tensor=True,
-        normalize_embeddings=True,
-    )
-
-    similarities = util.cos_sim(embeddings[0], embeddings[1:])[0]
-    best_index = similarities.argmax().item()
-
-    return max(0.0, similarities[best_index].item()), candidates[best_index]
+    # Fallback matrix using token overlap if model not loaded
+    sim_matrix = np.zeros((len(c_valid), len(t_valid)), dtype=float)
+    for i, c_str in enumerate(c_valid):
+        for j, t_str in enumerate(t_valid):
+            sim_matrix[i, j] = _token_overlap_similarity(c_str, t_str)
+    return sim_matrix, c_valid, t_valid
 
 
-# =====================================================
-# 4. Prepare CV Profile
-# =====================================================
+def best_semantic_match(candidate_items, target_items):
+    sim_matrix, c_valid, t_valid = compute_similarity_matrix(candidate_items, target_items)
+    if sim_matrix is None:
+        return 0.0
+    best_per_target = np.max(sim_matrix, axis=0)
+    return float(np.mean(best_per_target))
 
-def split_project_records(items):
+
+# ==========================================
+# 3. Evaluation Component: Skills
+# ==========================================
+
+def _evaluate_compound_requirement(req_clean: str, candidate_norm_list: list[str], full_cv_text_norm: str) -> str:
     """
-    Turn each project into one line per bullet, with the project name in front.
-    Short, separate lines match job requirements much better than one long block.
+    Evaluate compound skill requirements like:
+    'Expert in Figma: components, variants, auto layout, variables, and prototyping'
+    Returns 'matched', 'review', or 'missing'.
     """
-    results = []
+    req_norm = normalize_text(req_clean)
 
-    for item in to_list(items):
-        if isinstance(item, dict):
-            name = clean_text(item.get("name"))
+    # Check if requirement has colon or comma-separated sub-skills
+    if ":" in req_clean and "," in req_clean:
+        head, tail = req_clean.split(":", 1)
+        head_norm = normalize_text(head.replace("expert in", "").replace("proficient in", ""))
+        sub_skills = [
+            normalize_text(re.sub(r"^\band\b\s*", "", part.strip()))
+            for part in re.split(r",|\band\b", tail)
+            if normalize_text(part)
+        ]
+        head_matched = any(
+            contains_phrase(cn, head_norm) or contains_phrase(head_norm, cn)
+            for cn in candidate_norm_list
+        ) or contains_phrase(full_cv_text_norm, head_norm)
 
-            for desc in to_list(item.get("description")):
-                text = clean_text(desc)
-                if text:
-                    results.append(f"{name}: {text}" if name else text)
-        else:
-            text = clean_text(item)
-            if text:
-                results.append(text)
-
-    return results
-
-
-def prepare_cv_profile(cv_data):
-    ai_data = cv_data.get("ai_extracted_info") or {}
-
-    skills = ai_data.get("skills") or cv_data.get("skills") or []
-
-    experience = to_list(ai_data.get("experience"))
-    projects = to_list(ai_data.get("projects"))
-    education = to_list(ai_data.get("education"))
-
-    summary = clean_text(ai_data.get("professional_summary"))
-
-    skill_texts = [clean_text(skill) for skill in to_list(skills) if clean_text(skill)]
-
-    return {
-        "skills": skill_texts,
-        "summary": summary,
-        "experience": split_project_records(experience),
-        "projects": split_project_records(projects),
-        "education": flatten_records(education),
-        "experience_records": experience,
-    }
-
-
-# =====================================================
-# 5. Skill Matching
-# =====================================================
-
-def get_skill_evidence(profile):
-    """All CV text where a skill could appear."""
-    evidence = (
-        profile["skills"]
-        + [profile["summary"]]
-        + profile["experience"]
-        + profile["projects"]
-    )
-    return [item for item in evidence if item]
-
-
-def match_one_skill(skill, profile):
-    """
-    Outcomes:
-    - matched: the exact name is in the CV, or the meaning is close enough.
-    - potential_match: somewhat close, needs review.
-    - missing: not close enough.
-    """
-    evidence = get_skill_evidence(profile)
-
-    # 1. Exact name appears in the CV. No alias list needed.
-    for item in evidence:
-        if contains_phrase(item, skill):
-            return {
-                "requirement": skill,
-                "similarity": 100.0,
-                "score": 100.0,
-                "status": "matched",
-                "evidence": item,
-                "match_type": "exact",
-            }
-
-    # 2. Meaning-based similarity handles synonyms like "Postgres" vs "SQL databases".
-    similarity, best_evidence = best_semantic_match(skill, evidence)
-    percentage = round(similarity * 100, 2)
-
-    if similarity >= SKILL_MATCH_THRESHOLD:
-        status = "matched"
-        score = 100.0
-        match_type = "semantic"
-    elif similarity >= SKILL_REVIEW_THRESHOLD:
-        status = "potential_match"
-        score = 0.0
-        match_type = "semantic_review"
-    else:
-        status = "missing"
-        score = 0.0
-        match_type = "none"
-
-    return {
-        "requirement": skill,
-        "similarity": percentage,
-        "score": score,
-        "status": status,
-        "evidence": best_evidence,
-        "match_type": match_type,
-    }
-
-
-def extract_skill_alternatives(job_data, required_skills):
-    """Group skills written as alternatives, like 'FastAPI or Django' or 'FastAPI/Django'."""
-    summary = clean_text(job_data.get("summary"))
-    all_text = " ".join([summary] + [str(skill) for skill in required_skills])
-
-    skills = [str(skill).strip() for skill in required_skills if str(skill).strip()]
-    groups = []
-    used = set()
-
-    for i, first in enumerate(skills):
-        if first in used:
-            continue
-
-        for second in skills[i + 1:]:
-            if second in used:
-                continue
-
-            pattern = (
-                r"(?<!\w)" + re.escape(first)
-                + r"\s*(?:/|\bor\b)\s*"
-                + re.escape(second) + r"(?!\w)"
+        if sub_skills:
+            sub_hits = sum(
+                1 for sub in sub_skills
+                if any(contains_phrase(cn, sub) for cn in candidate_norm_list)
+                or contains_phrase(full_cv_text_norm, sub)
             )
-            reverse_pattern = (
-                r"(?<!\w)" + re.escape(second)
-                + r"\s*(?:/|\bor\b)\s*"
-                + re.escape(first) + r"(?!\w)"
-            )
+            ratio = sub_hits / len(sub_skills)
+            if head_matched and ratio >= 0.6:
+                return "matched"
+            if head_matched or ratio >= 0.3:
+                return "review"
+            return "missing"
 
-            if (re.search(pattern, all_text, re.IGNORECASE)
-                    or re.search(reverse_pattern, all_text, re.IGNORECASE)):
-                groups.append([first, second])
-                used.add(first)
-                used.add(second)
-                break
+    # Standard requirement check: candidate skill must cover the requirement
+    for c_norm in candidate_norm_list:
+        if req_norm == c_norm or contains_phrase(c_norm, req_norm):
+            return "matched"
+        # Only allow reverse containment if requirement is short (<= 3 words)
+        if len(req_norm.split()) <= 3 and len(c_norm.split()) >= 1 and contains_phrase(req_norm, c_norm):
+            return "matched"
 
-    result = []
-    for skill in skills:
-        if skill in used:
-            group = next(group for group in groups if skill in group)
-            if group not in result:
-                result.append(group)
-        else:
-            result.append([skill])
+    if len(req_norm.split()) <= 3 and contains_phrase(full_cv_text_norm, req_norm):
+        return "matched"
 
-    return result
+    return "missing"
 
 
-def match_required_skills(job_data, profile):
-    required_skills = to_list(job_data.get("required_skills"))
+def evaluate_skills_match(candidate_skills, job_required_skills, job_optional_skills=None, full_cv_text=""):
+    candidate_skills = to_list(candidate_skills)
+    job_required_skills = to_list(job_required_skills)
+    job_optional_skills = to_list(job_optional_skills)
 
-    if not required_skills:
+    if not job_required_skills:
         return {
             "score": 100.0,
-            "matched": [],
-            "potential_matches": [],
-            "missing": [],
-            "groups": [],
+            "matched_required_skills": [],
+            "review_required_skills": [],
+            "missing_required_skills": [],
+            "matched_optional_skills": [],
+            "missing_optional_skills": [],
+            "details": "No required skills specified in job description."
         }
 
-    groups = extract_skill_alternatives(job_data, required_skills)
+    candidate_clean = [clean_text(s) for s in candidate_skills if clean_text(s)]
+    candidate_norm = [normalize_text(s) for s in candidate_clean if normalize_text(s)]
+    full_cv_norm = normalize_text(full_cv_text or " ".join(candidate_clean))
 
-    group_results = []
-    matched = []
-    potential_matches = []
-    missing = []
+    matched_req = []
+    review_req = []
+    missing_req = []
 
-    for group in groups:
-        alternatives_results = [match_one_skill(skill, profile) for skill in group]
+    for req_skill in job_required_skills:
+        req_clean = clean_text(req_skill)
+        if not normalize_text(req_clean):
+            continue
 
-        # Pick the best alternative: a confirmed match beats a potential match.
-        best_result = max(
-            alternatives_results,
-            key=lambda item: (item["score"], item["similarity"]),
-        )
-
-        group_name = " OR ".join(group) if len(group) > 1 else group[0]
-        group_status = best_result["status"]
-
-        group_result = {
-            "requirement": group_name,
-            "alternatives": alternatives_results,
-            "score": best_result["score"],
-            "similarity": best_result["similarity"],
-            "status": group_status,
-            "matched_alternative": (
-                best_result["requirement"] if group_status == "matched" else None
-            ),
-            "evidence": best_result["evidence"],
-        }
-
-        group_results.append(group_result)
-
-        if group_status == "matched":
-            matched.append(group_result)
-        elif group_status == "potential_match":
-            potential_matches.append(group_result)
+        status = _evaluate_compound_requirement(req_clean, candidate_norm, full_cv_norm)
+        if status == "matched":
+            matched_req.append(req_clean)
+        elif status == "review":
+            review_req.append(req_clean)
         else:
-            missing.append(group_result)
+            missing_req.append(req_clean)
 
-    score = sum(item["score"] for item in group_results) / len(group_results)
+    # Semantic Fallback for unmatched required skills
+    if missing_req and candidate_clean:
+        sim_matrix, c_valid, t_valid = compute_similarity_matrix(candidate_clean, missing_req)
+        if sim_matrix is not None:
+            still_missing = []
+            for j, t_skill in enumerate(t_valid):
+                max_sim = float(np.max(sim_matrix[:, j])) if sim_matrix.shape[0] > 0 else 0.0
+                if max_sim >= SKILL_MATCH_THRESHOLD:
+                    matched_req.append(t_skill)
+                elif max_sim >= SKILL_REVIEW_THRESHOLD:
+                    review_req.append(t_skill)
+                else:
+                    still_missing.append(t_skill)
+            missing_req = still_missing
+
+    matched_opt = []
+    missing_opt = []
+    for opt_skill in job_optional_skills:
+        opt_clean = clean_text(opt_skill)
+        opt_norm = normalize_text(opt_clean)
+        if not opt_norm:
+            continue
+        direct_match = any(
+            opt_norm == c_norm or contains_phrase(c_norm, opt_norm)
+            for c_norm in candidate_norm
+        ) or contains_phrase(full_cv_norm, opt_norm)
+        if direct_match:
+            matched_opt.append(opt_clean)
+        else:
+            missing_opt.append(opt_clean)
+
+    total_req = len(job_required_skills)
+    matched_req_count = len(matched_req)
+    review_req_count = len(review_req)
+
+    base_score = ((matched_req_count + (0.5 * review_req_count)) / total_req) * 100.0 if total_req > 0 else 100.0
+
+    if job_optional_skills:
+        opt_ratio = len(matched_opt) / len(job_optional_skills)
+        bonus = opt_ratio * 10.0
+        final_score = min(100.0, base_score + bonus)
+    else:
+        final_score = base_score
 
     return {
-        "score": round(score, 2),
-        "matched": matched,
-        "potential_matches": potential_matches,
-        "missing": missing,
-        "groups": group_results,
+        "score": round(final_score, 2),
+        "matched_required_skills": matched_req,
+        "review_required_skills": review_req,
+        "missing_required_skills": missing_req,
+        "matched_optional_skills": matched_opt,
+        "missing_optional_skills": missing_opt,
+        "details": f"Matched {matched_req_count}/{total_req} required skills ({review_req_count} partial/review)."
     }
 
 
-# =====================================================
-# 6. Responsibility Matching
-# =====================================================
+# ==========================================
+# 4. Evaluation Component: Responsibilities
+# ==========================================
 
-def match_responsibilities(job_data, profile):
-    responsibilities = [
-        str(item) for item in to_list(job_data.get("responsibilities"))
-        if clean_text(item)
-    ]
+def evaluate_responsibilities_match(
+    candidate_experience_items,
+    candidate_projects,
+    job_responsibilities,
+    job_required_exp_years=0,
+):
+    job_responsibilities = to_list(job_responsibilities)
+    if not job_responsibilities:
+        return {
+            "score": 100.0,
+            "matched_responsibilities": [],
+            "missing_responsibilities": [],
+            "details": "No responsibilities specified in job description."
+        }
 
-    if not responsibilities:
-        return {"score": 100.0, "matched": [], "missing": []}
+    exp_texts = [clean_text(exp) for exp in to_list(candidate_experience_items) if clean_text(exp)]
+    proj_texts = [clean_text(proj) for proj in to_list(candidate_projects) if clean_text(proj)]
 
-    evidence = (
-        profile["experience"]
-        + profile["projects"]
-        + ([profile["summary"]] if profile["summary"] else [])
-    )
+    candidate_texts = exp_texts + proj_texts
+    if not candidate_texts:
+        return {
+            "score": 0.0,
+            "matched_responsibilities": [],
+            "missing_responsibilities": [clean_text(r) for r in job_responsibilities if clean_text(r)],
+            "details": "Candidate has no experience or projects text for responsibility matching."
+        }
 
-    matched = []
-    missing = []
+    sim_matrix, c_valid, t_valid = compute_similarity_matrix(candidate_texts, job_responsibilities)
+    if sim_matrix is None:
+        return {
+            "score": 0.0,
+            "matched_responsibilities": [],
+            "missing_responsibilities": [clean_text(r) for r in job_responsibilities if clean_text(r)],
+            "details": "Could not compute similarity matrix."
+        }
+
+    matched_resp = []
+    missing_resp = []
     scores = []
 
-    for responsibility in responsibilities:
-        similarity, best_evidence = best_semantic_match(responsibility, evidence)
-        percentage = round(similarity * 100, 2)
-        scores.append(percentage)
-
-        result = {
-            "requirement": responsibility,
-            "similarity": percentage,
-            "evidence": best_evidence,
-            "match_type": "semantic",
-        }
-
-        if similarity >= RESPONSIBILITY_THRESHOLD:
-            matched.append(result)
+    for j, resp in enumerate(t_valid):
+        max_sim = float(np.max(sim_matrix[:, j])) if sim_matrix.shape[0] > 0 else 0.0
+        scores.append(max_sim)
+        if max_sim >= RESPONSIBILITY_THRESHOLD:
+            matched_resp.append({"responsibility": resp, "similarity": round(max_sim, 2)})
         else:
-            missing.append(result)
+            missing_resp.append(resp)
+
+    avg_sim = float(np.mean(scores)) if scores else 0.0
+    raw_score = min(100.0, avg_sim * 100.0)
+
+    # Discount project-only alignment when role requires >=3 years of professional experience
+    project_only_multiplier = 0.65 if (not exp_texts and float(job_required_exp_years or 0) >= 3) else 1.0
+    final_score = round(raw_score * project_only_multiplier, 2)
 
     return {
-        "score": round(sum(scores) / len(scores), 2),
-        "matched": matched,
-        "missing": missing,
+        "score": final_score,
+        "matched_responsibilities": matched_resp,
+        "missing_responsibilities": missing_resp,
+        "details": (
+            f"Average semantic responsibility alignment: {round(avg_sim, 2)}"
+            + (" (discounted 35% because candidate has only projects and no formal work experience for a Senior role)." if project_only_multiplier < 1.0 else "")
+        )
     }
 
 
-# =====================================================
-# 7. Experience Evaluation
-# =====================================================
+# ==========================================
+# 5. Evaluation Component: Experience Years
+# ==========================================
 
-MONTHS = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
+def evaluate_experience_years_match(candidate_exp_years, job_required_exp_years, seniority_level="Not Specified"):
+    try:
+        c_years = float(candidate_exp_years or 0)
+    except (ValueError, TypeError):
+        c_years = 0.0
 
+    try:
+        r_years = float(job_required_exp_years or 0)
+    except (ValueError, TypeError):
+        r_years = 0.0
 
-def parse_date_parts(text):
-    text = str(text).lower()
-
-    matches = re.findall(
-        r"\b(january|february|march|april|may|june|july|august|"
-        r"september|sept|october|november|december|jan|feb|mar|"
-        r"apr|jun|jul|aug|sep|oct|nov|dec)\s+(\d{4})\b",
-        text,
-    )
-
-    if matches:
-        return [(int(year), MONTHS[month]) for month, year in matches]
-
-    years = re.findall(r"\b(19\d{2}|20\d{2})\b", text)
-    return [(int(year), 1) for year in years]
-
-
-def months_between(start, end):
-    return max(0, (end[0] - start[0]) * 12 + end[1] - start[1] + 1)
-
-
-def calculate_total_experience_months(experience_records):
-    records = [record for record in to_list(experience_records) if isinstance(record, dict)]
-
-    # No work experience section means 0 months, not "unknown".
-    if not records:
-        return 0
-
-    intervals = []
-    now = datetime.now()
-    current = (now.year, now.month)
-
-    for record in records:
-        dates_text = str(record.get("dates") or "")
-
-        if not dates_text:
-            continue
-
-        date_parts = parse_date_parts(dates_text)
-
-        if not date_parts:
-            continue
-
-        start = date_parts[0]
-
-        if re.search(r"\b(present|current|now)\b", dates_text, re.I):
-            end = current
-        elif len(date_parts) >= 2:
-            end = date_parts[1]
-        else:
-            end = start
-
-        if end < start:
-            continue
-
-        intervals.append((start, end))
-
-    # Records exist but no dates could be read: information is missing.
-    if not intervals:
-        return None
-
-    intervals.sort()
-
-    # Merge overlapping jobs so the same months are not counted twice.
-    merged = []
-    for start, end in intervals:
-        if not merged:
-            merged.append([start, end])
-        elif start <= merged[-1][1]:
-            if end > merged[-1][1]:
-                merged[-1][1] = end
-        else:
-            merged.append([start, end])
-
-    return sum(months_between(start, end) for start, end in merged)
-
-
-def parse_experience_requirement(requirements):
-    text = " ".join(str(item) for item in to_list(requirements)).lower()
-
-    numbers = re.findall(r"\d+(?:\.\d+)?", text)
-
-    if not numbers:
-        return None, None
-
-    if len(numbers) >= 2:
-        return float(numbers[0]), float(numbers[1])
-
-    value = float(numbers[0])
-
-    if any(word in text for word in ["less than", "under", "maximum", "up to"]):
-        return 0.0, value
-
-    return value, None
-
-
-def evaluate_experience(job_data, profile):
-    requirements = to_list(job_data.get("experience_requirements"))
-
-    if not requirements:
+    if r_years == 0:
         return {
             "score": 100.0,
-            "status": "not_required",
-            "candidate_experience_months": None,
-            "required_min_years": None,
-            "required_max_years": None,
+            "candidate_years": c_years,
+            "required_years": r_years,
+            "details": "No minimum experience years required."
         }
 
-    total_months = calculate_total_experience_months(profile["experience_records"])
-    minimum, maximum = parse_experience_requirement(requirements)
-
-    if total_months is None or minimum is None:
-        return {
-            "score": None,
-            "status": "not_provided",
-            "candidate_experience_months": total_months,
-            "required_min_years": minimum,
-            "required_max_years": maximum,
-        }
-
-    candidate_years = total_months / 12
-
-    if candidate_years < minimum:
-        score = candidate_years / minimum * 100 if minimum > 0 else 100.0
-        status = "below_requirement"
-    elif maximum is not None and candidate_years > maximum:
+    if c_years >= r_years:
         score = 100.0
-        status = "above_required_range"
+        details = f"Candidate experience ({c_years} yrs) meets or exceeds requirement ({r_years} yrs)."
     else:
-        score = 100.0
-        status = "meets_requirement"
-
-    return {
-        "score": round(min(score, 100.0), 2),
-        "status": status,
-        "candidate_experience_months": total_months,
-        "candidate_experience_years": round(candidate_years, 2),
-        "required_min_years": minimum,
-        "required_max_years": maximum,
-    }
-
-
-# =====================================================
-# 8. Education Evaluation
-# =====================================================
-
-def get_degree_level(text):
-    """Return the highest degree level found in the text (0 if none)."""
-    best = 0
-
-    for keyword, level in DEGREE_LEVELS.items():
-        if contains_phrase(text, keyword):
-            best = max(best, level)
-
-    return best
-
-
-def evaluate_education(job_data, profile):
-    requirements = [
-        clean_text(item) for item in to_list(job_data.get("education_requirements"))
-        if clean_text(item)
-    ]
-
-    if not requirements:
-        return {
-            "score": 100.0,
-            "status": "not_required",
-            "degree_verified": None,
-            "field_verified": None,
-            "candidate_education": profile["education"],
-        }
-
-    education_items = profile["education"]
-
-    if not education_items:
-        return {
-            "score": None,
-            "status": "not_provided",
-            "degree_verified": None,
-            "field_verified": None,
-            "candidate_education": [],
-        }
-
-    requirement_text = " ".join(requirements)
-    candidate_text = " ".join(education_items)
-
-    # Degree level check: candidate level must be at least the required level.
-    required_level = get_degree_level(requirement_text)
-    candidate_level = get_degree_level(candidate_text)
-
-    degree_verified = None
-    if required_level:
-        degree_verified = candidate_level >= required_level
-
-    # Field check (only when the requirement mentions a field of study).
-    field_verified = None
-    field_similarity = None
-    if re.search(r"\bin\b|field|major|discipline", normalize_text(requirement_text)):
-        similarity, _ = best_semantic_match(requirement_text, education_items)
-        field_similarity = round(similarity * 100, 2)
-        field_verified = similarity >= EDUCATION_FIELD_THRESHOLD
-
-    checks = [value for value in (degree_verified, field_verified) if value is not None]
-
-    if not checks:
-        return {
-            "score": None,
-            "status": "not_checked",
-            "degree_verified": degree_verified,
-            "field_verified": field_verified,
-            "candidate_education": education_items,
-        }
-
-    score = sum(100.0 if value else 0.0 for value in checks) / len(checks)
-
-    if all(checks):
-        status = "verified"
-    elif any(checks):
-        status = "partially_verified"
-    else:
-        status = "not_verified"
+        ratio = c_years / r_years
+        score = ratio * 100.0
+        details = f"Candidate experience ({c_years} yrs) is below requirement ({r_years} yrs)."
 
     return {
         "score": round(score, 2),
-        "status": status,
-        "degree_verified": degree_verified,
-        "field_verified": field_verified,
-        "field_similarity": field_similarity,
-        "candidate_education": education_items,
+        "candidate_years": c_years,
+        "required_years": r_years,
+        "seniority_level": seniority_level,
+        "details": details
     }
 
 
-# =====================================================
-# 9. Final Score Calculation
-# =====================================================
+# ==========================================
+# 6. Evaluation Component: Education
+# ==========================================
 
-def calculate_final_score(criteria):
-    available_score = 0.0
-    available_weight = 0.0
-    total_weight = sum(WEIGHTS.values())
-
-    for name, weight in WEIGHTS.items():
-        score = criteria[name].get("score")
-
-        # Criteria with no information are excluded from the final score.
-        if score is None:
-            continue
-
-        available_score += score * weight
-        available_weight += weight
-
-    if available_weight == 0:
-        return {"matching_score": None, "evaluation_coverage": 0.0}
-
-    return {
-        "matching_score": round(available_score / available_weight, 2),
-        "evaluation_coverage": round(available_weight / total_weight * 100, 2),
-    }
+def get_degree_level(degree_text):
+    norm = normalize_text(degree_text)
+    best_lvl = 0
+    for deg, lvl in DEGREE_LEVELS.items():
+        if contains_phrase(norm, deg):
+            best_lvl = max(best_lvl, lvl)
+    return best_lvl
 
 
-# =====================================================
-# 10. Main Matching Engine
-# =====================================================
+def evaluate_education_match(candidate_education, job_education_reqs):
+    candidate_education = to_list(candidate_education)
+    job_education_reqs = to_list(job_education_reqs)
 
-def match_cv_to_job(cv_data, job_data):
-    if not isinstance(cv_data, dict):
-        raise TypeError("cv_data must be a dictionary.")
+    c_texts = [clean_text(e) for e in candidate_education if clean_text(e)]
+    c_max_degree = max([get_degree_level(t) for t in c_texts] + [0])
 
-    if not isinstance(job_data, dict):
-        raise TypeError("job_data must be a dictionary.")
+    if not job_education_reqs:
+        return {
+            "score": 100.0,
+            "detected_candidate_degree_level": c_max_degree,
+            "details": "No explicit education requirements specified in job description."
+        }
 
-    profile = prepare_cv_profile(cv_data)
+    if not candidate_education:
+        return {
+            "score": 50.0,
+            "detected_candidate_degree_level": 0,
+            "details": "No education details found on candidate CV."
+        }
 
-    skills_result = match_required_skills(job_data, profile)
-    responsibilities_result = match_responsibilities(job_data, profile)
-    experience_result = evaluate_experience(job_data, profile)
-    education_result = evaluate_education(job_data, profile)
+    j_texts = [clean_text(e) for e in job_education_reqs if clean_text(e)]
+    j_max_degree = max([get_degree_level(t) for t in j_texts] + [0])
 
-    criteria = {
-        "required_skills": skills_result,
-        "responsibilities": responsibilities_result,
-        "experience": experience_result,
-        "education": education_result,
-    }
-
-    score_result = calculate_final_score(criteria)
-
-    final_score = score_result["matching_score"]
-    coverage = score_result["evaluation_coverage"]
-
-    if final_score is None:
-        status = "Insufficient Information"
-    elif final_score >= ACCEPTANCE_THRESHOLD:
-        status = "Suitable for Interview"
+    if j_max_degree == 0 or c_max_degree >= j_max_degree:
+        degree_score = 100.0
+    elif c_max_degree == j_max_degree - 1:
+        degree_score = 75.0
     else:
-        status = "Not Suitable Yet"
+        degree_score = 50.0
+
+    sim_score = best_semantic_match(c_texts, j_texts)
+    field_score = min(100.0, sim_score * 100.0)
+    final_score = (degree_score * 0.6) + (field_score * 0.4)
 
     return {
-        "job_title": job_data.get("job_title", ""),
-        "career_field": job_data.get("career_field", ""),
-        "matching_score": final_score,
-        "acceptance_threshold": ACCEPTANCE_THRESHOLD,
-        "evaluation_coverage": coverage,
-        "score_type": "Weighted matching score, not a probability",
+        "score": round(final_score, 2),
+        "detected_candidate_degree_level": c_max_degree,
+        "degree_level_match_score": degree_score,
+        "field_match_score": round(field_score, 2),
+        "details": f"Degree level match: {degree_score}%, Field match: {round(field_score, 2)}%"
+    }
+
+
+# ==========================================
+# 7. Main Function: match_cv_to_job
+# ==========================================
+
+def match_cv_to_job(cv_data, job_requirements):
+    ai_info = cv_data.get("ai_extracted_info", {})
+    sections = cv_data.get("sections", {})
+
+    cand_skills = ai_info.get("skills") or cv_data.get("skills") or sections.get("skills", [])
+    cand_exp_items = ai_info.get("work_experience") or sections.get("experience", [])
+    cand_projects = ai_info.get("projects") or sections.get("projects", [])
+    cand_edu = ai_info.get("education") or sections.get("education", [])
+    full_cv_text = cv_data.get("cleaned_text") or cv_data.get("full_text") or clean_text(sections)
+
+    cand_years = 0.0
+    if "total_experience_years" in ai_info and ai_info["total_experience_years"] is not None:
+        try:
+            cand_years = float(ai_info["total_experience_years"])
+        except (ValueError, TypeError):
+            cand_years = 0.0
+    elif "experience_years" in cv_data and cv_data["experience_years"] is not None:
+        try:
+            cand_years = float(cv_data["experience_years"])
+        except (ValueError, TypeError):
+            cand_years = 0.0
+
+    job_req_skills = job_requirements.get("required_skills", [])
+    job_opt_skills = job_requirements.get("optional_skills", [])
+    job_resp = job_requirements.get("responsibilities", [])
+    job_exp_years = job_requirements.get("required_experience_years", 0)
+    job_seniority = job_requirements.get("seniority_level", "Not Specified")
+    job_edu = job_requirements.get("education_requirements", [])
+
+    skills_res = evaluate_skills_match(cand_skills, job_req_skills, job_opt_skills, full_cv_text=full_cv_text)
+    resp_res = evaluate_responsibilities_match(cand_exp_items, cand_projects, job_resp, job_required_exp_years=job_exp_years)
+    exp_res = evaluate_experience_years_match(cand_years, job_exp_years, job_seniority)
+    edu_res = evaluate_education_match(cand_edu, job_edu)
+
+    # Balanced weights: Skills (45%), Responsibilities (25%), Experience (20%), Education (10%)
+    overall_score = (
+        (skills_res["score"] * 0.45) +
+        (resp_res["score"] * 0.25) +
+        (exp_res["score"] * 0.20) +
+        (edu_res["score"] * 0.10)
+    )
+    overall_score = round(overall_score, 2)
+
+    seniority_warning = None
+    if float(job_exp_years or 0) >= 3 and cand_years < (float(job_exp_years) * 0.5):
+        seniority_warning = (
+            f"Seniority Gap: Role requires {job_exp_years}+ years ({job_seniority}), "
+            f"while candidate has {cand_years} years of professional experience."
+        )
+
+    if overall_score >= ACCEPTANCE_THRESHOLD and not seniority_warning:
+        fit_level = "Strong Match"
+        status = "Accepted for Interview"
+    elif overall_score >= 60.0 and not seniority_warning:
+        fit_level = "Good Match"
+        status = "Potentially Suitable"
+    elif overall_score >= 40.0:
+        fit_level = "Moderate Match (Junior / Partial Alignment)" if seniority_warning else "Moderate Match"
+        status = "Not Accepted (Seniority / Skill Gap)" if seniority_warning else "Needs Review"
+    else:
+        fit_level = "Low Match"
+        status = "Rejected"
+
+    skill_gaps = skills_res.get("missing_required_skills", []) + skills_res.get("review_required_skills", [])
+    missing_skills_structured = [{"requirement": s} for s in skill_gaps]
+
+    return {
+        "job_title": job_requirements.get("job_title", "Not Specified"),
+        "overall_score": overall_score,
+        "matching_score": overall_score,
+        "evaluation_coverage": "100%",
+        "fit_level": fit_level,
         "status": status,
-        "weights": WEIGHTS,
-        "criteria_scores": criteria,
-        "missing_skills": skills_result["missing"],
-        "missing_responsibilities": responsibilities_result["missing"],
-        "evaluation_notes": [
-            "The matching score is not a probability of being hired.",
-            "Criteria with no information are excluded from the final score.",
-            "Evaluation coverage shows how much of the job criteria could be evaluated.",
-            "Exact skill names are checked first, then meaning-based similarity is used.",
-            "Thresholds should be validated on a labeled set of CV and job pairs.",
-        ],
+        "seniority_warning": seniority_warning,
+        "sub_scores": {
+            "skills": skills_res["score"],
+            "responsibilities": resp_res["score"],
+            "experience": exp_res["score"],
+            "education": edu_res["score"],
+        },
+        "breakdown": {
+            "skills": skills_res,
+            "responsibilities": resp_res,
+            "experience": exp_res,
+            "education": edu_res,
+        },
+        "skill_gaps": skill_gaps,
+        "missing_skills": missing_skills_structured,
+        "summary": (
+            f"Candidate achieved an overall match score of {overall_score}% ({fit_level}). "
+            f"Skills: {skills_res['score']}%, Responsibilities: {resp_res['score']}%, "
+            f"Experience: {exp_res['score']}%, Education: {edu_res['score']}%."
+            + (f" Warning: {seniority_warning}" if seniority_warning else "")
+        ),
     }

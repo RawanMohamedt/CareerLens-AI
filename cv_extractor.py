@@ -10,8 +10,28 @@ from docx.oxml.table import CT_Tbl
 
 
 # =========================================================
-# 1. استخراج النص من PDF
+# 1. قراءة ملفات PDF (مع استخراج الروابط التشعبية المدمجة /Annots)
 # =========================================================
+
+def _extract_pdf_page_links(page) -> list[str]:
+    """Extract embedded hyperlink URIs from a PDF page's /Annots dictionary."""
+    urls: list[str] = []
+    try:
+        annots = page.get("/Annots")
+        if not annots:
+            return urls
+        for annot in annots:
+            obj = annot.get_object()
+            action = obj.get("/A") if obj else None
+            if action and "/URI" in action:
+                uri = str(action["/URI"]).strip()
+                if uri and not uri.lower().startswith("mailto:"):
+                    if uri not in urls:
+                        urls.append(uri)
+    except Exception:
+        pass
+    return urls
+
 
 def read_pdf(file_path: Path) -> str:
     try:
@@ -20,218 +40,143 @@ def read_pdf(file_path: Path) -> str:
         # التحقق من تشفير الملف
         if reader.is_encrypted:
             raise ValueError(
-                "ملف PDF مشفر. يجب توفير كلمة المرور أولاً."
+                "ملف PDF مشفر ولقد تعذر قراءته."
             )
 
         pages_text = []
+        embedded_links: list[str] = []
 
         for page_number, page in enumerate(reader.pages, start=1):
-            page_text = page.extract_text() or ""
-
-            if page_text.strip():
+            page_text = (page.extract_text() or "").strip()
+            if page_text:
                 pages_text.append(page_text)
-            else:
-                # قد تكون الصفحة صورة أو صفحة فارغة
-                warnings.warn(
-                    f"لم يتم استخراج نص من الصفحة {page_number} "
-                    f"في الملف: {file_path.name}"
-                )
+            for link in _extract_pdf_page_links(page):
+                if link not in embedded_links:
+                    embedded_links.append(link)
 
-        result = "\n".join(pages_text)
+        full_text = "\n\n".join(pages_text).strip()
 
-        if not result.strip():
+        # إلحاق الروابط المدمجة في حال لم تكن مكتوبة كنص صريح داخل الصفحة
+        missing_links = [
+            url for url in embedded_links
+            if url not in full_text
+        ]
+        if missing_links:
+            full_text = f"{full_text}\n\nEmbedded Links:\n" + "\n".join(missing_links)
+
+        if not full_text.strip():
             warnings.warn(
-                "لم يتم استخراج أي نص. قد يحتاج الملف إلى OCR."
+                f"الملف {file_path.name} فارغ أو يحتوي على صور فقط بدون نص محدد."
             )
 
-        return result
+        return full_text.strip()
 
-    except (ValueError, RuntimeError):
-        raise
-
-    except Exception as e:
+    except Exception as error:
         raise RuntimeError(
-            f"خطأ أثناء قراءة PDF '{file_path.name}': {e}"
-        ) from e
+            f"حدث خطأ أثناء قراءة ملف PDF: {error}"
+        ) from error
 
 
 # =========================================================
-# 2. المرور على فقرات وجداول Word بترتيب ظهورها
+# 2. قراءة ملفات Word (DOCX)
 # =========================================================
 
-def iter_docx_blocks(parent):
-    """
-    المرور على الفقرات والجداول حسب ترتيبها في المستند.
-    يدعم المستند وخلايا الجداول.
-    """
-    if hasattr(parent, "element") and hasattr(parent.element, "body"):
-        parent_element = parent.element.body
+def _iter_block_items(parent):
+    if isinstance(parent, docx.document.Document):
+        parent_elm = parent.element.body
     elif hasattr(parent, "_tc"):
-        parent_element = parent._tc
+        parent_elm = parent._tc
     else:
-        parent_element = parent.element
+        raise TypeError("عنصر غير مدعوم لاستخراج الكتل")
 
-    for child in parent_element.iterchildren():
-
+    for child in parent_elm.iterchildren():
         if isinstance(child, CT_P):
             yield Paragraph(child, parent)
-
         elif isinstance(child, CT_Tbl):
             yield Table(child, parent)
 
 
-def extract_docx_content(parent, output):
-    """
-    استخراج الفقرات والجداول، مع محاولة دعم
-    الجداول المتداخلة داخل خلايا الجداول.
-    """
-    for block in iter_docx_blocks(parent):
-
-        if isinstance(block, Paragraph):
-            paragraph_text = block.text.strip()
-
-            if paragraph_text:
-                output.append(paragraph_text)
-
-        elif isinstance(block, Table):
-            for row in block.rows:
-                row_cells = []
-
-                for cell in row.cells:
-                    cell_parts = []
-
-                    extract_docx_content(
-                        cell,
-                        cell_parts
-                    )
-
-                    cell_text = " ".join(
-                        part.strip()
-                        for part in cell_parts
-                        if part.strip()
-                    )
-
-                    row_cells.append(cell_text)
-
-                # الحفاظ على حدود الصفوف والخلايا
-                if any(row_cells):
-                    output.append(" | ".join(row_cells))
-
-
 def read_docx(file_path: Path) -> str:
     try:
-        document = docx.Document(str(file_path))
-        text_parts = []
+        doc = docx.Document(str(file_path))
+        full_element_text = []
 
-        extract_docx_content(
-            document,
-            text_parts
-        )
+        for block in _iter_block_items(doc):
+            if isinstance(block, Paragraph):
+                text = block.text.strip()
+                if text:
+                    full_element_text.append(text)
 
-        return "\n".join(text_parts)
+            elif isinstance(block, Table):
+                for row in block.rows:
+                    row_text = [
+                        cell.text.strip()
+                        for cell in row.cells
+                        if cell.text.strip()
+                    ]
+                    if row_text:
+                        full_element_text.append(" | ".join(row_text))
 
-    except Exception as e:
+        extracted_text = "\n".join(full_element_text).strip()
+
+        if not extracted_text:
+            warnings.warn(
+                f"الملف {file_path.name} فارغ أو لا يحتوي على نصوص قابلة للقراءة."
+            )
+
+        return extracted_text
+
+    except Exception as error:
         raise RuntimeError(
-            f"خطأ أثناء قراءة Word '{file_path.name}': {e}"
-        ) from e
+            f"حدث خطأ أثناء قراءة ملف DOCX: {error}"
+        ) from error
 
 
 # =========================================================
-# 3. استخراج النص من TXT مع التعامل مع الترميز
+# 3. قراءة ملفات النص TXT
 # =========================================================
 
 def read_txt(file_path: Path) -> str:
-    encodings = [
-        "utf-8-sig",
-        "utf-8",
-        "cp1256",
-        "cp1252",
-    ]
-
-    last_error = None
+    encodings = ["utf-8", "utf-8-sig", "cp1256", "latin-1"]
 
     for encoding in encodings:
         try:
-            return file_path.read_text(
-                encoding=encoding
-            )
+            with open(file_path, "r", encoding=encoding) as file:
+                content = file.read().strip()
+                if not content:
+                    warnings.warn(f"الملف {file_path.name} فارغ.")
+                return content
+        except UnicodeDecodeError:
+            continue
+        except Exception as error:
+            raise RuntimeError(
+                f"حدث خطأ أثناء قراءة ملف TXT: {error}"
+            ) from error
 
-        except UnicodeDecodeError as e:
-            last_error = e
-
-    raise RuntimeError(
-        f"تعذر تحديد ترميز ملف TXT '{file_path.name}'. "
-        f"آخر خطأ: {last_error}"
+    raise ValueError(
+        f"تعذر تحديد ترميز الملف {file_path.name} باستخدام الترميزات المدعومة."
     )
 
 
 # =========================================================
-# 4. خريطة امتدادات الملفات
+# 4. الدالة الرئيسية لاستخراج النص حسب امتداد الملف
 # =========================================================
 
-HANDLERS = {
-    ".pdf": read_pdf,
-    ".docx": read_docx,
-    ".txt": read_txt,
-}
+def extract_text_from_cv(file_path: str | Path) -> str:
+    path = Path(file_path)
 
+    if not path.exists():
+        raise FileNotFoundError(f"الملف غير موجود في المسار: {path}")
 
-# =========================================================
-# 5. الدالة الرئيسية لاستخراج النص
-# =========================================================
+    extension = path.suffix.lower()
 
-def extract_text(file_path_str: str) -> str:
-    file_path = Path(file_path_str)
-
-    # التحقق من وجود الملف
-    if not file_path.exists():
-        raise FileNotFoundError(
-            f"الملف غير موجود: {file_path}"
-        )
-
-    # التأكد أن المسار يشير إلى ملف
-    if not file_path.is_file():
+    if extension == ".pdf":
+        return read_pdf(path)
+    elif extension == ".docx":
+        return read_docx(path)
+    elif extension == ".txt":
+        return read_txt(path)
+    else:
         raise ValueError(
-            f"المسار لا يشير إلى ملف: {file_path}"
+            f"صيغة الملف '{extension}' غير مدعومة. الصيغ المدعومة هي: .pdf, .docx, .txt"
         )
-
-    # تحديد نوع الملف
-    ext = file_path.suffix.lower()
-    handler = HANDLERS.get(ext)
-
-    if handler is None:
-        supported = ", ".join(HANDLERS.keys())
-
-        raise ValueError(
-            f"امتداد غير مدعوم: {ext or 'بدون امتداد'}. "
-            f"الامتدادات المدعومة: {supported}"
-        )
-
-    # استخراج النص
-    text = handler(file_path)
-
-    return text
-
-
-# =========================================================
-# 6. تجربة الكود
-# =========================================================
-
-if __name__ == "__main__":
-
-    cv_path = "my_cv.docx"
-
-    try:
-        raw_text = extract_text(cv_path)
-
-        if raw_text.strip():
-            print("تم استخراج النص بنجاح.")
-            print("-" * 50)
-            print(raw_text)
-        else:
-            print(
-                "الملف موجود، لكن لم يتم استخراج نص منه."
-            )
-
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
-        print(f"حدث خطأ: {e}")
