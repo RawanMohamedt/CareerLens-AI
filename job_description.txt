@@ -1,0 +1,25 @@
+
+Job Title: Junior Python Backend Developer
+
+We are looking for a Junior Python Backend Developer to join our engineering team.
+
+Requirements:
+- Good knowledge of Python.
+- Experience with FastAPI or Django.
+- Understanding of REST APIs.
+- Knowledge of SQL databases.
+- Familiarity with Git and GitHub.
+- Basic knowledge of Docker.
+
+Responsibilities:
+- Develop and maintain backend applications.
+- Build and integrate REST APIs.
+- Work with databases.
+- Fix bugs and improve application performance.
+- Collaborate with frontend developers.
+
+Experience:
+0-2 years of experience.
+
+Education:
+Bachelor's degree in Computer Science or a related field.
