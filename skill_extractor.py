@@ -13,12 +13,14 @@ except ImportError:
     Language = Any
     PhraseMatcher = Any
 
+
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "en_core_web_sm"
 
+
 # =========================================================
-# 1. Multi-Domain Skills Vocabulary (Software, Data/AI, UI/UX, Product, ERP)
+# 1. Multi-Domain Skills Vocabulary
 # =========================================================
 
 DEFAULT_SKILLS: tuple[str, ...] = (
@@ -38,23 +40,28 @@ DEFAULT_SKILLS: tuple[str, ...] = (
     "REST API", "REST APIs", "GraphQL",
     "FastAPI", "Flask", "Django",
     "Bootstrap", "Tailwind CSS",
-    "Responsive Design", "Responsive Interfaces", "Web Development",
+    "Responsive Design", "Responsive Interfaces",
+    "Web Development",
 
     # UI/UX & Product Design
     "UI/UX Design", "UX/UI Design", "UX Design", "UI Design",
-    "User Research", "UX Research", "User Interviews", "Stakeholder Interviews",
-    "User Flows", "User Journeys", "Journey Mapping", "Personas",
+    "User Research", "UX Research", "User Interviews",
+    "Stakeholder Interviews", "User Flows", "User Journeys",
+    "Journey Mapping", "Personas",
     "Information Architecture", "Wireframing", "Wireframes",
     "Prototyping", "Interactive Prototypes", "High-Fidelity UI",
     "High-Fidelity Prototypes", "Low-Fidelity Prototypes",
     "Usability", "Usability Testing", "Usability Reviews",
-    "Visual Hierarchy", "Layout & Spacing", "Typography", "Color Theory",
-    "Design Systems", "Design System", "Component Libraries", "UI Components",
-    "Figma", "Auto Layout", "Figma Variables", "Figma Components", "Dev Mode",
-    "Developer Handoff", "Sketch", "Adobe XD", "Photoshop", "Illustrator",
+    "Visual Hierarchy", "Layout & Spacing", "Typography",
+    "Color Theory", "Design Systems", "Design System",
+    "Component Libraries", "UI Components",
+    "Figma", "Auto Layout", "Figma Variables",
+    "Figma Components", "Dev Mode", "Developer Handoff",
+    "Sketch", "Adobe XD", "Photoshop", "Illustrator",
     "InVision", "Framer", "Zeplin", "Miro", "FigJam",
-    "Accessibility", "WCAG", "Arabic RTL", "Bilingual Interfaces",
-    "Micro-interactions", "Motion Design", "Brand Identity",
+    "Accessibility", "WCAG", "Arabic RTL",
+    "Bilingual Interfaces", "Micro-interactions",
+    "Motion Design", "Brand Identity",
 
     # Mobile Development
     "Flutter", "React Native", "Android Development",
@@ -85,6 +92,11 @@ DEFAULT_SKILLS: tuple[str, ...] = (
     "Computer Vision", "Matplotlib", "Seaborn",
     "Power BI", "Tableau", "Excel",
 )
+
+
+# =========================================================
+# 2. Skill Aliases
+# =========================================================
 
 SKILL_ALIASES: dict[str, str] = {
     "golang": "Go",
@@ -124,12 +136,18 @@ SKILL_ALIASES: dict[str, str] = {
     "usability reviews": "Usability Testing",
 }
 
+
 PRESERVE_CASE_SKILLS: set[str] = {
-    "C", "C++", "C#", "R", "Go", "Git", "AWS", "GCP", "SQL", "OOP",
-    "LINQ", "NLP", "CI/CD", "UI/UX Design", "UX Design", "UI Design",
+    "C", "C++", "C#", "R", "Go", "Git", "AWS", "GCP",
+    "SQL", "OOP", "LINQ", "NLP", "CI/CD",
+    "UI/UX Design", "UX Design", "UI Design",
     "WCAG", "ERP", "SaaS", "Odoo", "Adobe XD"
 }
 
+
+# =========================================================
+# 3. Data Structures
+# =========================================================
 
 class SkillOccurrence(TypedDict):
     canonical: str
@@ -147,25 +165,32 @@ class SkillExtractionResult:
 
 
 # =========================================================
-# 2. Spacy Pipeline Loader (with Pure-Regex Fallback if spaCy unavailable)
+# 4. spaCy Pipeline Loader
 # =========================================================
 
 @lru_cache(maxsize=1)
 def get_nlp_model() -> Language | None:
+
     if spacy is None:
         return None
+
     try:
         return spacy.load(MODEL_NAME)
+
     except OSError:
-        logger.info("Model '%s' not found. Falling back to spacy.blank('en').", MODEL_NAME)
+        logger.info(
+            "Model '%s' not found. Falling back to spacy.blank('en').",
+            MODEL_NAME
+        )
         return spacy.blank("en")
 
 
 # =========================================================
-# 3. Matcher Construction
+# 5. Canonicalize Skill Names
 # =========================================================
 
 def canonicalize_skill_name(skill_name: str) -> str:
+
     cleaned = skill_name.strip()
     lower_name = cleaned.lower()
 
@@ -181,26 +206,40 @@ def canonicalize_skill_name(skill_name: str) -> str:
     return cleaned.title()
 
 
+# =========================================================
+# 6. Matcher Construction
+# =========================================================
+
 @lru_cache(maxsize=1)
 def get_skill_matcher() -> tuple[PhraseMatcher | None, dict[str, str]]:
+
     canonical_map: dict[str, str] = {}
+
     for skill in DEFAULT_SKILLS:
         canonical_map[skill.lower()] = canonicalize_skill_name(skill)
+
     for alias, canonical in SKILL_ALIASES.items():
         canonical_map[alias.lower()] = canonical
 
     nlp = get_nlp_model()
+
     if nlp is None:
         return None, canonical_map
 
     matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
-    patterns = [nlp.make_doc(k) for k in canonical_map]
+
+    patterns = [
+        nlp.make_doc(skill)
+        for skill in canonical_map
+    ]
+
     matcher.add("SKILLS", patterns)
+
     return matcher, canonical_map
 
 
 # =========================================================
-# 4. Special skills regex matcher (C, C++, C#, R, Go, UI/UX, etc.)
+# 7. Special Skills Regex Matcher
 # =========================================================
 
 SPECIAL_SKILLS_PATTERNS = [
@@ -217,12 +256,21 @@ SPECIAL_SKILLS_PATTERNS = [
 
 
 def extract_special_skills(text: str) -> list[SkillOccurrence]:
+
     occurrences: list[SkillOccurrence] = []
 
     for pattern, canonical in SPECIAL_SKILLS_PATTERNS:
-        flags = re.IGNORECASE if canonical not in {"C", "R", "Go"} else 0
+
+        flags = (
+            re.IGNORECASE
+            if canonical not in {"C", "R", "Go"}
+            else 0
+        )
+
         for match in re.finditer(pattern, text, flags=flags):
+
             matched_text = match.group(0)
+
             occurrences.append({
                 "canonical": canonical,
                 "matched_text": matched_text,
@@ -235,33 +283,51 @@ def extract_special_skills(text: str) -> list[SkillOccurrence]:
 
 
 # =========================================================
-# 5. Extract Skills Function
+# 8. Main Skills Extraction Function
 # =========================================================
 
 def extract_skills(text: str) -> SkillExtractionResult:
+
     if not text or not text.strip():
         return SkillExtractionResult()
 
     nlp = get_nlp_model()
+
     matcher, canonical_map = get_skill_matcher()
 
     occurrences: list[SkillOccurrence] = []
+
     seen_spans = set()
 
     if nlp is not None and matcher is not None:
+
         doc = nlp(text)
+
         matches = matcher(doc)
+
         for match_id, start, end in matches:
+
             span = doc[start:end]
+
             span_key = (span.start_char, span.end_char)
+
             if span_key in seen_spans:
                 continue
+
             seen_spans.add(span_key)
+
             matched_text = span.text.strip()
+
             matched_lower = matched_text.lower()
+
             if matched_lower in {"c", "r", "go"}:
                 continue
-            canonical = canonical_map.get(matched_lower, canonicalize_skill_name(matched_text))
+
+            canonical = canonical_map.get(
+                matched_lower,
+                canonicalize_skill_name(matched_text)
+            )
+
             occurrences.append({
                 "canonical": canonical,
                 "matched_text": matched_text,
@@ -269,52 +335,112 @@ def extract_skills(text: str) -> SkillExtractionResult:
                 "end_char": span.end_char,
                 "confidence": 0.90
             })
+
     else:
-        # Pure-regex fallback when spaCy is not installed
-        for phrase_lower, canonical in sorted(canonical_map.items(), key=lambda x: -len(x[0])):
-            if phrase_lower in {"c", "r", "go", "c++", "c#", ".net", ".net core", "asp.net", "asp.net core"}:
+
+        # Pure-regex fallback when spaCy is unavailable
+
+        for phrase_lower, canonical in sorted(
+            canonical_map.items(),
+            key=lambda x: -len(x[0])
+        ):
+
+            if phrase_lower in {
+                "c", "r", "go", "c++", "c#",
+                ".net", ".net core",
+                "asp.net", "asp.net core"
+            }:
                 continue
-            pattern = r"(?<![A-Za-z0-9#+])" + re.escape(phrase_lower) + r"(?![A-Za-z0-9#+])"
-            for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-                span_key = (m.start(), m.end())
-                if any(not (m.end() <= s or m.start() >= e) for s, e in seen_spans):
+
+            pattern = (
+                r"(?<![A-Za-z0-9#+])"
+                + re.escape(phrase_lower)
+                + r"(?![A-Za-z0-9#+])"
+            )
+
+            for match in re.finditer(
+                pattern,
+                text,
+                flags=re.IGNORECASE
+            ):
+
+                span_key = (match.start(), match.end())
+
+                if any(
+                    not (match.end() <= start or match.start() >= end)
+                    for start, end in seen_spans
+                ):
                     continue
+
                 seen_spans.add(span_key)
+
                 occurrences.append({
                     "canonical": canonical,
-                    "matched_text": m.group(0),
-                    "start_char": m.start(),
-                    "end_char": m.end(),
+                    "matched_text": match.group(0),
+                    "start_char": match.start(),
+                    "end_char": match.end(),
                     "confidence": 0.90
                 })
 
+    # Extract special skills
+
     special_occurrences = extract_special_skills(text)
-    for spec in special_occurrences:
-        span_key = (spec["start_char"], spec["end_char"])
-        if not any(not (spec["end_char"] <= s or spec["start_char"] >= e) for s, e in seen_spans):
+
+    for special in special_occurrences:
+
+        span_key = (
+            special["start_char"],
+            special["end_char"]
+        )
+
+        if not any(
+            not (
+                special["end_char"] <= start
+                or special["start_char"] >= end
+            )
+            for start, end in seen_spans
+        ):
+
             seen_spans.add(span_key)
-            occurrences.append(spec)
+
+            occurrences.append(special)
 
     occurrences.sort(key=lambda x: x["start_char"])
 
-    raw_skills = [occ["matched_text"] for occ in occurrences]
-    canonical_skills = list(dict.fromkeys(occ["canonical"] for occ in occurrences))
+    raw_skills = [
+        occurrence["matched_text"]
+        for occurrence in occurrences
+    ]
+
+    canonical_skills = list(dict.fromkeys(
+        occurrence["canonical"]
+        for occurrence in occurrences
+    ))
 
     return SkillExtractionResult(
         raw_skills=raw_skills,
         canonical_skills=canonical_skills,
         occurrences=occurrences
     )
-    def extract_skills_and_entities(
+
+
+# =========================================================
+# 9. Skills + Named Entities Function
+# =========================================================
+
+def extract_skills_and_entities(
     text: str,
     custom_skills_list: list[str] | None = None,
 ) -> dict[str, Any]:
 
-    # 1. Extract skills using the existing function
+    # Extract skills using the existing function
+
     result = extract_skills(text)
 
-    # 2. Add custom skills
+    # Add custom skills
+
     for skill in custom_skills_list or []:
+
         pattern = (
             r"(?<![A-Za-z0-9+#])"
             + re.escape(skill)
@@ -322,16 +448,20 @@ def extract_skills(text: str) -> SkillExtractionResult:
         )
 
         if re.search(pattern, text, flags=re.IGNORECASE):
+
             canonical = skill.strip()
 
             if canonical not in result.canonical_skills:
                 result.canonical_skills.append(canonical)
 
-    # 3. Extract named entities
+    # Extract named entities
+
     entities = []
+
     nlp = get_nlp_model()
 
     if nlp is not None:
+
         doc = nlp(text)
 
         entities = [
@@ -344,8 +474,9 @@ def extract_skills(text: str) -> SkillExtractionResult:
             for ent in doc.ents
         ]
 
-    # 4. Return the structure expected by main.py
+    # Return the structure expected by main.py
+
     return {
         "skills": result.canonical_skills,
         "entities": entities,
-        }
+    }
