@@ -103,7 +103,7 @@ if not check_password():
 
 with st.spinner("جاري تحميل النظام..."):
     from main import analyze_cv, _write_json_atomic
-    from cv_extractor import extract_text
+    from cv_extractor import extract_text_from_cv as extract_text
     from job_description_analyzer import analyze_job_description
     from matching_engine import match_cv_to_job
     from learning_advisor import build_advisor_section
