@@ -305,3 +305,47 @@ def extract_skills(text: str) -> SkillExtractionResult:
         canonical_skills=canonical_skills,
         occurrences=occurrences
     )
+    def extract_skills_and_entities(
+    text: str,
+    custom_skills_list: list[str] | None = None,
+) -> dict[str, Any]:
+
+    # 1. Extract skills using the existing function
+    result = extract_skills(text)
+
+    # 2. Add custom skills
+    for skill in custom_skills_list or []:
+        pattern = (
+            r"(?<![A-Za-z0-9+#])"
+            + re.escape(skill)
+            + r"(?![A-Za-z0-9+#])"
+        )
+
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            canonical = skill.strip()
+
+            if canonical not in result.canonical_skills:
+                result.canonical_skills.append(canonical)
+
+    # 3. Extract named entities
+    entities = []
+    nlp = get_nlp_model()
+
+    if nlp is not None:
+        doc = nlp(text)
+
+        entities = [
+            {
+                "text": ent.text,
+                "label": ent.label_,
+                "start_char": ent.start_char,
+                "end_char": ent.end_char,
+            }
+            for ent in doc.ents
+        ]
+
+    # 4. Return the structure expected by main.py
+    return {
+        "skills": result.canonical_skills,
+        "entities": entities,
+        }
